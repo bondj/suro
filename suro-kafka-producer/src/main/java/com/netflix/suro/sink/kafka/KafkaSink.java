@@ -209,7 +209,7 @@ public class KafkaSink implements Sink {
     public void writeTo(final MessageContainer message) {
         queuedRecords.incrementAndGet();
         if(!isOpened) {
-            dropOrRetryMessage(message, Integer.MAX_VALUE, "sinkNotOpened",null);
+            dropMessage(message.getRoutingKey(), "sinkNotOpened",null);
             return;
         }
         runRecordCounterListener();
@@ -378,7 +378,7 @@ public class KafkaSink implements Sink {
                         // try to put back to the queue if there is still space
                         wrapper.incrementAndGetRetryCount(t);
                         if(!metadataWaitingQueue.offer(wrapper)) {
-                            dropOrRetryMessage(message, Integer.MAX_VALUE,"metadataWaitingQueueFull",t);
+                            dropMessage(topic,"metadataWaitingQueueFull",t);
                         }
                     }
                 }
