@@ -53,6 +53,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -66,8 +67,8 @@ public class KafkaSink implements Sink {
 
     public final static String TYPE = "kafka";
 
-    private final static MessageContainer SHUTDOWN_POISON_MSG = new StringMessage("suro-KafkaSink-shutdownMsg-routingKey",
-            "suro-KafkaSink-shutdownMsg-body");
+    private final static MessageContainerWrapper SHUTDOWN_POISON_MSG = new MessageContainerWrapper( new StringMessage("suro-KafkaSink-shutdownMsg-routingKey",
+            "suro-KafkaSink-shutdownMsg-body"),null);
 
     private final boolean normalizeRoutingKey;
     private final String clientId;
@@ -81,7 +82,7 @@ public class KafkaSink implements Sink {
     private final Partitioner partitioner;
     private final Properties props;
     private final Set<String> metadataFetchedTopicSet;
-    private final BlockingQueue<MessageContainer> metadataWaitingQueue;
+    private final BlockingQueue<MessageContainerWrapper> metadataWaitingQueue;
     private final ExecutorService executor;
 
     private volatile boolean isOpened = false;
@@ -151,7 +152,7 @@ public class KafkaSink implements Sink {
         props.setProperty(ProducerConfig.METRIC_REPORTER_CLASSES_CONFIG, ServoReporter.class.getName());
 
         this.metadataFetchedTopicSet = new CopyOnWriteArraySet<String>();
-        this.metadataWaitingQueue = new ArrayBlockingQueue<MessageContainer>(this.metadataWaitingQueueSize);
+        this.metadataWaitingQueue = new LinkedBlockingQueue<MessageContainerWrapper>(this.metadataWaitingQueueSize);
         this.executor = Executors.newSingleThreadExecutor(
                 new ThreadFactoryBuilder().setDaemon(true).setNameFormat("KafkaSink-MetadataFetcher-%d").build());
         
@@ -208,14 +209,14 @@ public class KafkaSink implements Sink {
     public void writeTo(final MessageContainer message) {
         queuedRecords.incrementAndGet();
         if(!isOpened) {
-            dropMessage(getRoutingKey(message), "sinkNotOpened",null);
+            dropOrRetryMessage(message, Integer.MAX_VALUE, "sinkNotOpened",null);
             return;
         }
         runRecordCounterListener();
 
         final String routingKey = getRoutingKey(message);
         if (metadataFetchedTopicSet.contains(routingKey)) {
-            sendMessage(message);
+            sendMessage(message,0);
         } else {
             DynamicCounter.increment(
                     MonitorConfig
@@ -224,8 +225,8 @@ public class KafkaSink implements Sink {
                             .withTag(TagKey.TOPIC, routingKey)
                             .withTag(TagKey.CLIENT_ID, clientId)
                             .build());
-            if(!metadataWaitingQueue.offer(message)) {
-                dropMessage(getRoutingKey(message), "metadataWaitingQueueFull",null);
+            if(!metadataWaitingQueue.offer(new MessageContainerWrapper(message, new MetaDataWaitingQueueFallException()))) {
+            	dropOrRetryMessage(message, Integer.MAX_VALUE, "metadataWaitingQueueFull",null);
             }
         }
     }
@@ -236,7 +237,8 @@ public class KafkaSink implements Sink {
         }
     }
 
-    private void sendMessage(final MessageContainer message) {
+    private void sendMessage(final MessageContainer message, final int retryCount) {
+    	
         final String topic = getRoutingKey(message);
 
         byte[] key = null;
@@ -266,7 +268,7 @@ public class KafkaSink implements Sink {
             part = partitioner.partition(topic, key, producer.partitionsFor(topic));
         } catch(Exception e) {
             log.debug("partitioner failure: " + topic, e);
-            dropMessage(topic, "partitionerError",e);
+            dropOrRetryMessage(message, retryCount, "partitionerError",e);
             // abort send
             return;
         }
@@ -279,59 +281,58 @@ public class KafkaSink implements Sink {
                             .withTag(TagKey.TOPIC, topic)
                             .withTag(TagKey.CLIENT_ID, clientId)
                             .build());
-            producer.send(
-                new ProducerRecord(topic, part, key, message.getMessage().getPayload()),
-                new Callback() {
-                    @Override
-                    public void onCompletion(RecordMetadata metadata, Exception e) {
-                        if (e != null) {
-                            log.debug("Failed to send: " + topic, e);
-                            String droppedReason = "sendError";
-                            if(e instanceof RecordTooLargeException) {
-                                droppedReason = "recordTooLarge";
-                            }
-                            dropMessage(topic, droppedReason,e);
-                            runRecordCounterListener();
-                        } else {
-                            DynamicCounter.increment(
-                                    MonitorConfig
-                                            .builder("sentRecord")
-                                            .withTag(TagKey.ROUTING_KEY, topic)
-                                            .withTag(TagKey.TOPIC, topic)
-                                            .withTag(TagKey.CLIENT_ID, clientId)
-                                            .build());
-                            sentRecords.incrementAndGet();
-                            runRecordCounterListener();
-                        }
-                    }
-                });
+			producer.send(new ProducerRecord(topic, part, key, message.getMessage().getPayload()), new Callback() {
+				@Override
+				public void onCompletion(RecordMetadata metadata, Exception e) {
+					if (e != null) {
+						log.debug("Failed to send: " + topic, e);
+						if (e instanceof RecordTooLargeException) {
+							dropMessage(topic, "recordTooLarge", null);
+						} else {
+							dropOrRetryMessage(message, retryCount, "sendError", e);
+						}
+					} else {
+						DynamicCounter.increment(MonitorConfig.builder("sentRecord").withTag(TagKey.ROUTING_KEY, topic)
+						        .withTag(TagKey.TOPIC, topic).withTag(TagKey.CLIENT_ID, clientId).build());
+						sentRecords.incrementAndGet();
+						runRecordCounterListener();
+					}
+				}
+			});
         } catch (Exception e) {
             log.debug("Failed to submit send: " + topic, e);
-            dropMessage(topic, "submitSendError",e);
+            dropOrRetryMessage(message, retryCount, "submitSendError",e);
         }
     }
 
+    
+    private void dropOrRetryMessage(final MessageContainer message, final int retryCount,final String reason, final Throwable throwable) {
+    	
+    	if(retryCount>5 || !metadataWaitingQueue.offer(new MessageContainerWrapper(message, new MetaDataWaitingQueueFallException(),retryCount+1))) 	
+    	{
+    		dropMessage(message.getRoutingKey(), reason, throwable);
+    	}
+    }
+    
     /*Package level for testing*/
-    void dropMessage(final String routingKey, final String reason, final Throwable throwable) {
-        MonitorConfig.Builder mcb = MonitorConfig.builder("droppedRecord")
-                .withTag(TagKey.ROUTING_KEY, routingKey)
-                .withTag(TagKey.DROPPED_REASON, reason)
-                .withTag(TagKey.TOPIC, routingKey)
-                .withTag(TagKey.CLIENT_ID, clientId);
+    void dropMessage(final String routingKey, final String reason, final Throwable throwable)
+    {
+   
+		MonitorConfig.Builder mcb = MonitorConfig.builder("droppedRecord").withTag(TagKey.ROUTING_KEY, routingKey)
+		        .withTag(TagKey.DROPPED_REASON, reason).withTag(TagKey.TOPIC, routingKey)
+		        .withTag(TagKey.CLIENT_ID, clientId);
 
-        if(null!=throwable)
-        {
-            mcb=mcb.withTag(TagKey.EXCEPTION_CLASS,throwable.getClass().getSimpleName());
-            Throwable cause = throwable.getCause();
-            if(null!=cause)
-            {
-                mcb=mcb.withTag(TagKey.CAUSEDBY_CLASS,cause.getClass().getSimpleName());
-            }
-        }
+		if (null != throwable) {
+			mcb = mcb.withTag(TagKey.EXCEPTION_CLASS, throwable.getClass().getSimpleName());
+			Throwable cause = throwable.getCause();
+			if (null != cause) {
+				mcb = mcb.withTag(TagKey.CAUSEDBY_CLASS, cause.getClass().getSimpleName());
+			}
+		}
 
-        DynamicCounter.increment(mcb.build());
-        droppedRecords.incrementAndGet();
-        runRecordCounterListener();
+		DynamicCounter.increment(mcb.build());
+		droppedRecords.incrementAndGet();
+		runRecordCounterListener();
     }
 
     @Override
@@ -341,31 +342,43 @@ public class KafkaSink implements Sink {
             @Override
             public void run() {
                 while(true) {
-                    final MessageContainer message;
+                    MessageContainerWrapper wrapper;
                     try {
-                        message = metadataWaitingQueue.poll(1, TimeUnit.SECONDS);
+                        wrapper = metadataWaitingQueue.poll(1, TimeUnit.SECONDS);
                     } catch (InterruptedException e) {
                         continue;
                     }
-                    if(message == null) {
+                    if(wrapper == null) {
                         continue;
                     }
-                    // check poison msg for shutdown
-                    if(message == SHUTDOWN_POISON_MSG) {
+                    
+                    //check poison msg for shutdown
+                    if(wrapper == SHUTDOWN_POISON_MSG) {
                         break;
                     }
+                    
+                    final MessageContainer message = wrapper.getMessageContainer();
+                    
+                    if(message==null)
+                    {
+                        dropMessage(wrapper.getRoutingKey(),"Dropped due to GC", wrapper.getThrowable());
+                    	continue;
+                    }
+                    
+                    
                     final String topic = getRoutingKey(message);
                     try {
                         if (!metadataFetchedTopicSet.contains(topic)) {
                             producer.partitionsFor(topic);
                             metadataFetchedTopicSet.add(topic);
                         }
-                        sendMessage(message);
+                        sendMessage(message,wrapper.getRetryCount());
                     } catch(Throwable t) {
                         log.error("failed to get metadata: " + topic, t);
                         // try to put back to the queue if there is still space
-                        if(!metadataWaitingQueue.offer(message)) {
-                            dropMessage(getRoutingKey(message), "metadataWaitingQueueFull",t);
+                        wrapper.incrementAndGetRetryCount(t);
+                        if(!metadataWaitingQueue.offer(wrapper)) {
+                            dropOrRetryMessage(message, Integer.MAX_VALUE,"metadataWaitingQueueFull",t);
                         }
                     }
                 }
